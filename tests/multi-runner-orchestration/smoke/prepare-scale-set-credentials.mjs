@@ -3,26 +3,12 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { aws } from './support.mjs';
+import { findScaleSetControllerService } from './scale-set-support.mjs';
 
 const cluster = process.env.MINISTACK_SCALE_SET_CLUSTER
   ?? 'multi-runner-webhook-scale-set';
-const serviceArns = (await aws('ecs', 'list-services', '--cluster', cluster)).serviceArns ?? [];
-assert.ok(serviceArns.length > 0, `No ECS service found in cluster ${cluster}`);
-
-const serviceResponse = await aws(
-  'ecs', 'describe-services',
-  '--cluster', cluster,
-  '--services', serviceArns[0],
-);
-const service = serviceResponse.services?.[0];
-assert.ok(service?.taskDefinition, `No task definition found for service ${serviceArns[0]}`);
-
-const taskDefinitionResponse = await aws(
-  'ecs', 'describe-task-definition',
-  '--task-definition', service.taskDefinition,
-);
-const taskDefinition = taskDefinitionResponse.taskDefinition;
-assert.ok(taskDefinition, `Could not describe task definition ${service.taskDefinition}`);
+const controllerService = await findScaleSetControllerService(cluster);
+const taskDefinition = structuredClone(controllerService.taskDefinition);
 
 for (const field of [
   'taskDefinitionArn',
@@ -65,7 +51,7 @@ try {
   await aws(
     'ecs', 'update-service',
     '--cluster', cluster,
-    '--service', service.serviceName,
+    '--service', controllerService.service.serviceName,
     '--task-definition', taskDefinitionArn,
     '--force-new-deployment',
   );

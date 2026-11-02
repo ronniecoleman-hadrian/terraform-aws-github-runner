@@ -21,17 +21,18 @@ docker compose -f tests/multi-runner-orchestration/docker-compose.yml down
 
 ## MiniStack fixtures
 
-`docker compose -f tests/multi-runner-orchestration/docker-compose.yml up --build` runs `.ci/build.sh` to build the Lambda distributions, starts MiniStack, seeds AMIs and the `scale-set-controller` ECR repository/policy, builds the controller for `linux/amd64` and `linux/arm64`, and pushes it to MiniStack. The Compose services use `linux/amd64`; CI enables QEMU to build the ARM64 image on its AMD64 runner.
+`docker compose --parallel 1 -f tests/multi-runner-orchestration/docker-compose.yml up --build` runs `.ci/build.sh` to build the Lambda distributions, starts MiniStack, seeds the AMI, the `scale-set-controller` ECR repository/policy, builds the controller for `linux/amd64` and `linux/arm64`, and pushes it to MiniStack. The Compose services use `linux/amd64`; CI enables QEMU to build the ARM64 image on its AMD64 runner.
 
 The controller image build is configured directly in the `docker-buildx` Compose service; it is not a fixture in `fixtures/ministack-fixtures.json`. Compose creates the `multi-runner-orchestration` network and attaches MiniStack's nested ECS containers to it. The AWS CLI uses `ministack:4566` to reach MiniStack. The job resolves MiniStack's network IP for BuildKit's registry push, since BuildKit does not resolve Compose service DNS in this setup; it configures that registry as plain HTTP.
 
 ## Programmatic MiniStack smoke test
 
-Compose owns the environment lifecycle: `run smoke-tests` starts the required WireMock and MiniStack dependencies, seeds AWS fixtures, builds the Lambda archives and scale-set controller image, applies `examples/multi-runner-orchestration`, then runs the smoke-test container. The command streams the Node.js reporter output and returns the smoke container's exit code. The job first registers a scale-set task-definition revision with dummy MiniStack credentials and updates the ECS service:
+Compose owns the environment lifecycle. Run `terraform-apply` as a blocking step before starting the smoke test container; the smoke command uses `--no-deps` so it cannot begin early or trigger a second apply. The apply service starts its prerequisites, seeds AWS fixtures, builds the Lambda archives and scale-set controller image, then applies `examples/multi-runner-orchestration`. The smoke step runs only after that command exits successfully and returns the smoke container's exit code. The job first registers a scale-set task-definition revision with dummy MiniStack credentials and updates the ECS service:
 
 ```sh
-docker compose -f tests/multi-runner-orchestration/docker-compose.yml build
-docker compose -f tests/multi-runner-orchestration/docker-compose.yml run --no-TTY --rm smoke-tests
+docker compose --parallel 1 -f tests/multi-runner-orchestration/docker-compose.yml build
+docker compose -f tests/multi-runner-orchestration/docker-compose.yml run --no-TTY --rm terraform-apply
+docker compose -f tests/multi-runner-orchestration/docker-compose.yml run --no-TTY --rm --no-deps smoke-tests
 ```
 
 Stop the long-running MiniStack and WireMock services after the command finishes:

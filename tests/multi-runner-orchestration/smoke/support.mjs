@@ -97,17 +97,61 @@ export async function assertEc2RunnerCount(expectedCount) {
   const environment = process.env.MINISTACK_RUNNER_ENVIRONMENT ?? 'multi-runner-webhook-ec2';
   const description = `${expectedCount} active EC2 runner(s) in ${environment}`;
 
-  await waitFor(description, async () => {
-    const response = await aws(
+  try {
+    return await waitFor(description, async () => {
+      const response = await aws(
+        'ec2', 'describe-instances',
+        '--filters',
+        `Name=tag:ghr:environment,Values=${environment}`,
+        'Name=instance-state-name,Values=pending,running',
+      );
+      const instances = (response.Reservations ?? []).flatMap((reservation) => reservation.Instances ?? []);
+      return instances.length === expectedCount ? instances : false;
+    });
+  } catch (error) {
+    const allInstances = await aws(
       'ec2', 'describe-instances',
-      '--filters',
-      `Name=tag:ghr:environment,Values=${environment}`,
-      'Name=instance-state-name,Values=pending,running',
-    );
-    const instances = (response.Reservations ?? []).flatMap((reservation) => reservation.Instances ?? []);
-    return instances.length === expectedCount;
-  });
+      '--filters', `Name=tag:ghr:environment,Values=${environment}`,
+    ).catch((diagnosticError) => ({ diagnosticError: diagnosticError.message }));
+    const instances = (allInstances.Reservations ?? [])
+      .flatMap((reservation) => reservation.Instances ?? [])
+      .map(({ InstanceId, State, StateReason, LaunchTime, Tags }) => ({
+        instanceId: InstanceId,
+        state: State?.Name,
+        stateReason: StateReason?.Message,
+        launchTime: LaunchTime,
+        name: Tags?.find(({ Key }) => Key === 'Name')?.Value,
+      }));
+    const logGroups = [
+      '/aws/lambda/multi-runner-webhook-webhook',
+      `/aws/lambda/${environment}-scale-up`,
+      `/aws/lambda/${environment}-pool`,
+    ];
+    const logs = await Promise.all(logGroups.map(async (logGroup) => ({
+      logGroup,
+      messages: await logMessages(logGroup, Date.now() - 15 * 60_000),
+    })));
+    const logContext = logs
+      .map(({ logGroup, messages }) => `${logGroup}:\n${messages.slice(-10).join('\n') || 'No recent messages'}`)
+      .join('\n');
 
+    throw new Error(
+      `${error.message}\nEC2 instances with environment ${environment}: ${JSON.stringify(instances.length ? instances : allInstances)}\nRecent Lambda logs:\n${logContext}`,
+      { cause: error },
+    );
+  }
+}
+
+export async function assertEc2InstancesTerminated(instances) {
+  for (const { InstanceId } of instances) {
+    await waitFor(`EC2 instance ${InstanceId} to reach terminated state`, async () => {
+      const response = await aws('ec2', 'describe-instances', '--instance-ids', InstanceId);
+      const instance = (response.Reservations ?? [])
+        .flatMap((reservation) => reservation.Instances ?? [])
+        .find(({ InstanceId: id }) => id === InstanceId);
+      return instance?.State?.Name === 'terminated';
+    });
+  }
 }
 
 export async function waitFor(description, predicate, attempts = 90) {
@@ -174,13 +218,14 @@ export async function sendWorkflowJob(labels) {
   const signature = createHmac('sha256', secret).update(eventBody).digest('hex');
   const webhookUrl = new URL(endpoint);
   const startTime = Date.now() - 1000;
+  const deliveryId = `node-smoke-${randomUUID()}`;
   const response = await postWebhook(
     webhookUrl.host,
     `${webhookUrl.pathname}${webhookUrl.search}`,
     {
       'content-type': 'application/json',
       'x-github-event': 'workflow_job',
-      'x-github-delivery': `node-smoke-${randomUUID()}`,
+      'x-github-delivery': deliveryId,
       'x-github-hook-installation-target-id': '123',
       'x-hub-signature-256': `sha256=${signature}`,
     },
@@ -191,7 +236,49 @@ export async function sendWorkflowJob(labels) {
     throw new Error(`Webhook failed with HTTP ${response.status}: ${response.body}`);
   }
 
-  return { jobId, startTime };
+  return { jobId, deliveryId, startTime };
+}
+
+export async function assertWebhookJobReceivedAndDispatched(jobId, deliveryId, startTime) {
+  const webhookLogGroup = '/aws/lambda/multi-runner-webhook-webhook';
+  const dispatcherLogGroup = '/aws/lambda/multi-runner-webhook-dispatch-to-runner';
+  await assertCloudWatchLogContains(
+    webhookLogGroup,
+    `webhook delivery ${deliveryId} accepted for job ${jobId}`,
+    deliveryId,
+    startTime,
+  );
+  await assertCloudWatchLogContains(
+    webhookLogGroup,
+    `webhook delivery ${deliveryId} parsed workflow job ${jobId}`,
+    `\"workflowJobId\":${jobId}`,
+    startTime,
+  );
+  await assertCloudWatchLogContains(
+    dispatcherLogGroup,
+    `webhook delivery ${deliveryId} dispatched job ${jobId} to a runner queue`,
+    `Successfully dispatched job for test-owner/test-repo to the queue(s)`,
+    startTime,
+  );
+  await assertCloudWatchLogContains(
+    dispatcherLogGroup,
+    `webhook delivery ${deliveryId} matched job ${jobId}`,
+    `Job ID: ${jobId}`,
+    startTime,
+  );
+}
+
+export async function assertEc2InstanceType(instances, expectedTypes, description) {
+  if (instances.length !== 1) {
+    throw new Error(`${description}: expected one EC2 instance, found ${instances.length}`);
+  }
+
+  const [{ InstanceId, InstanceType }] = instances;
+  if (!expectedTypes.includes(InstanceType)) {
+    throw new Error(
+      `${description}: EC2 instance ${InstanceId} has type ${InstanceType}; expected ${expectedTypes.join(' or ')}`,
+    );
+  }
 }
 
 export function postWebhook(host, pathname, headers, body) {
